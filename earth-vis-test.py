@@ -387,9 +387,10 @@ def query_pixel_colors(latitudes, longitudes, image_data, trans):
 
     return pixel_values
 
+
 hfov = 66.1
-width = 640
-height = 360
+width = 4608
+height = 2592
 resolution = np.array([width, height])
 geotiff_folder = 'region_mosaics'
 
