@@ -1,8 +1,127 @@
 import rasterio
-import numpy as np
 import os
-from scipy.spatial import transform
+import numpy as np
+import matplotlib.pyplot as plt
 
+# Define MGRS latitude bands and UTM exceptions
+latitude_bands = [
+    {"name": "C", "min_lat": -80, "max_lat": -72},
+    {"name": "D", "min_lat": -72, "max_lat": -64},
+    {"name": "E", "min_lat": -64, "max_lat": -56},
+    {"name": "F", "min_lat": -56, "max_lat": -48},
+    {"name": "G", "min_lat": -48, "max_lat": -40},
+    {"name": "H", "min_lat": -40, "max_lat": -32},
+    {"name": "J", "min_lat": -32, "max_lat": -24},
+    {"name": "K", "min_lat": -24, "max_lat": -16},
+    {"name": "L", "min_lat": -16, "max_lat": -8},
+    {"name": "M", "min_lat": -8, "max_lat": 0},
+    {"name": "N", "min_lat": 0, "max_lat": 8},
+    {"name": "P", "min_lat": 8, "max_lat": 16},
+    {"name": "Q", "min_lat": 16, "max_lat": 24},
+    {"name": "R", "min_lat": 24, "max_lat": 32},
+    {"name": "S", "min_lat": 32, "max_lat": 40},
+    {"name": "T", "min_lat": 40, "max_lat": 48},
+    {"name": "U", "min_lat": 48, "max_lat": 56},
+    {"name": "V", "min_lat": 56, "max_lat": 64},
+    {"name": "W", "min_lat": 64, "max_lat": 72},
+    {"name": "X", "min_lat": 72, "max_lat": 84},  # X spans 12° latitude
+]
+
+utm_exceptions = [
+    {"zone": 32, "min_lon": 3, "max_lon": 12, "bands": ["V"]},  # Norway
+    {"zone": 31, "min_lon": 0, "max_lon": 9, "bands": ["X"]},  # Svalbard
+    {"zone": 33, "min_lon": 9, "max_lon": 21, "bands": ["X"]},  # Svalbard
+    {"zone": 35, "min_lon": 21, "max_lon": 33, "bands": ["X"]},  # Svalbard
+    {"zone": 37, "min_lon": 33, "max_lon": 42, "bands": ["X"]},  # Svalbard
+]
+
+
+class EarthImageSimulator:
+    def __init__(self, geotiff_folder, resolution, hfov):
+        """
+        Initialize the Earth image simulator.
+
+        Parameters:
+            geotiff_folder (str): Path to the folder containing GeoTIFF files.
+            resolution (tuple): Camera resolution (width, height).
+            hfov (float): Horizontal field of view in degrees.
+        """
+        self.cache = GeoTIFFCache(geotiff_folder)
+        self.resolution = resolution
+        self.hfov = hfov
+
+    def simulate_image(self, position, orientation):
+        """
+        Simulate an Earth image given the satellite position and orientation.
+
+        Parameters:
+            position (np.ndarray): Satellite position in ECEF coordinates (3,).
+            orientation (np.ndarray): Satellite orientation as a 3x3 rotation matrix.
+
+        Returns:
+            np.ndarray: Simulated RGB image.
+        """
+        # Initialize the camera
+        camera = Camera(self.resolution, self.hfov, position, orientation)
+
+        # Generate ray directions in ECEF frame
+        ray_directions_ecef = camera.rays_in_ecef()
+
+        # Intersect rays with the Earth
+        intersection_points = intersect_ellipsoid(ray_directions_ecef, position)
+
+        # Convert intersection points to lat/lon
+        lat_lon = convert_to_lat_lon(intersection_points)
+
+        # Flatten latitude/longitude grid
+        lat_lon_flat = lat_lon.reshape(-1, 2)
+        latitudes = lat_lon_flat[:, 0]
+        longitudes = lat_lon_flat[:, 1]
+
+        # Calculate present MGRS regions
+        mgrs_regions = calculate_mgrs_zones(latitudes, longitudes)
+        present_regions = np.unique(mgrs_regions)
+
+        # Initialize full image with zeros
+        width, height = self.resolution
+        pixel_colors_full = np.zeros((height, width, 3), dtype=np.uint8)
+
+        # Load and assign data for each region
+        for region in present_regions:
+            data, trans = self.cache.load_geotiff_data(region)
+            if data is None:
+                continue
+
+            # Mask for the current region
+            region_mask = (mgrs_regions == region).reshape(height, width)
+
+            # Skip if no pixels belong to this region
+            if not np.any(region_mask):
+                continue
+
+            # Query pixel colors for the region
+            pixel_colors_region = query_pixel_colors(
+                latitudes[region_mask.flatten()],
+                longitudes[region_mask.flatten()],
+                data,
+                trans
+            )
+
+            # Assign pixel values to the full image
+            pixel_colors_full[region_mask] = pixel_colors_region
+
+        return pixel_colors_full
+
+    def display_image(self, image):
+        """
+        Display the simulated image.
+
+        Parameters:
+            image (np.ndarray): Simulated RGB image.
+        """
+        plt.imshow(image)
+        plt.axis('off')
+        plt.show()
 
 class GeoTIFFCache:
     def __init__(self, geotiff_folder):
@@ -34,9 +153,6 @@ class GeoTIFFCache:
     def clear_cache(self):
         self.cache = {}
 
-
-
-# define camera
 class Camera:
     def __init__(self, resolution, fov, position, orientation):
         """
@@ -187,54 +303,6 @@ def convert_to_lat_lon(intersection_points, a = 6378137.0, b = 6356752.314245):
 
     return lat_lon_flat.reshape(H, W, 2)
 
-
-hfov = 66.1
-width = 640
-height = 360
-resolution = np.array([width, height])
-satellite_position = np.array([983017.6742974258, -6109867.766065873, 3098940.646932125])
-orientation = get_nadir_rotation(satellite_position)
-camera = Camera(resolution, hfov, satellite_position, orientation)
-ray_directions_ecef = camera.rays_in_ecef()
-intersection_points = intersect_ellipsoid(ray_directions_ecef, satellite_position)
-lat_lon = convert_to_lat_lon(intersection_points)
-
-# Define MGRS latitude bands and UTM exceptions
-latitude_bands = [
-    {"name": "C", "min_lat": -80, "max_lat": -72},
-    {"name": "D", "min_lat": -72, "max_lat": -64},
-    {"name": "E", "min_lat": -64, "max_lat": -56},
-    {"name": "F", "min_lat": -56, "max_lat": -48},
-    {"name": "G", "min_lat": -48, "max_lat": -40},
-    {"name": "H", "min_lat": -40, "max_lat": -32},
-    {"name": "J", "min_lat": -32, "max_lat": -24},
-    {"name": "K", "min_lat": -24, "max_lat": -16},
-    {"name": "L", "min_lat": -16, "max_lat": -8},
-    {"name": "M", "min_lat": -8, "max_lat": 0},
-    {"name": "N", "min_lat": 0, "max_lat": 8},
-    {"name": "P", "min_lat": 8, "max_lat": 16},
-    {"name": "Q", "min_lat": 16, "max_lat": 24},
-    {"name": "R", "min_lat": 24, "max_lat": 32},
-    {"name": "S", "min_lat": 32, "max_lat": 40},
-    {"name": "T", "min_lat": 40, "max_lat": 48},
-    {"name": "U", "min_lat": 48, "max_lat": 56},
-    {"name": "V", "min_lat": 56, "max_lat": 64},
-    {"name": "W", "min_lat": 64, "max_lat": 72},
-    {"name": "X", "min_lat": 72, "max_lat": 84},  # X spans 12° latitude
-]
-
-utm_exceptions = [
-    {"zone": 32, "min_lon": 3, "max_lon": 12, "bands": ["V"]},  # Norway
-    {"zone": 31, "min_lon": 0, "max_lon": 9, "bands": ["X"]},  # Svalbard
-    {"zone": 33, "min_lon": 9, "max_lon": 21, "bands": ["X"]},  # Svalbard
-    {"zone": 35, "min_lon": 21, "max_lon": 33, "bands": ["X"]},  # Svalbard
-    {"zone": 37, "min_lon": 33, "max_lon": 42, "bands": ["X"]},  # Svalbard
-]
-
-# Create lookup tables for vectorized latitude band calculation
-latitude_band_names = np.array([band["name"] for band in latitude_bands])
-latitude_band_edges = np.array([[band["min_lat"], band["max_lat"]] for band in latitude_bands])
-
 def calculate_mgrs_zones(latitudes, longitudes):
     """
     Vectorized computation of MGRS regions for given latitude and longitude arrays.
@@ -246,6 +314,11 @@ def calculate_mgrs_zones(latitudes, longitudes):
     Returns:
         np.ndarray: Array of MGRS region identifiers (same shape as input).
     """
+    # Create lookup tables for vectorized latitude band calculation
+    latitude_band_names = np.array([band["name"] for band in latitude_bands])
+    latitude_band_edges = np.array([[band["min_lat"], band["max_lat"]] for band in latitude_bands])
+
+
     # Flatten lat/lon for processing
     lat_flat = latitudes.ravel()
     lon_flat = longitudes.ravel()
@@ -314,54 +387,16 @@ def query_pixel_colors(latitudes, longitudes, image_data, trans):
 
     return pixel_values
 
-lat_lon_flat = lat_lon.reshape(-1, 2)
-latitudes = lat_lon_flat[:, 0]
-longitudes = lat_lon_flat[:, 1]
-mgrs_regions = calculate_mgrs_zones(latitudes, longitudes)
-present_regions = np.unique(mgrs_regions)
-print(present_regions)
+hfov = 66.1
+width = 640
+height = 360
+resolution = np.array([width, height])
+geotiff_folder = 'region_mosaics'
 
-cache = GeoTIFFCache('region_mosaics')
+satellite_position = np.array([983017.6742974258, -6109867.766065873, 3098940.646932125])
+orientation = get_nadir_rotation(satellite_position)
 
-for region in present_regions:
+simulator = EarthImageSimulator(geotiff_folder, resolution, hfov)
 
-    data, trans = cache.load_geotiff_data(region)
-    if data is not None:
-        print(f"Found data for region {region}")
-    else:
-        print(f"No data found for region {region}")
-        continue
-
-    region_mask = (mgrs_regions == region)
-
-    if not np.any(region_mask):
-        continue
-
-    latitudes_region = latitudes[region_mask]
-    longitudes_region = longitudes[region_mask]
-
-    image_data, trans = cache.load_geotiff_data(region)
-    pixel_colors_region = query_pixel_colors(
-        latitudes_region, longitudes_region, image_data, trans
-    )
-
-    if "pixel_colors_full" not in locals():
-        pixel_colors_full = np.zeros((width, height, 3), dtype=np.uint8)
-
-    # Flatten the full image and region mask for consistent indexing
-    pixel_colors_full_flat = pixel_colors_full.reshape(-1, 3)
-    region_mask_flat = region_mask.flatten()
-
-    # Ensure pixel colors match the number of True values in the mask
-    assert pixel_colors_region.shape[0] == np.sum(region_mask_flat), \
-        "Mismatch between region mask size and pixel values."
-
-    # Assign region-specific pixel values to the flattened full image
-    pixel_colors_full_flat[region_mask_flat] = pixel_colors_region
-
-    # Reshape the flat full image back to its original shape
-    pixel_colors_full = pixel_colors_full_flat.reshape(height, width, 3)
-
-import matplotlib.pyplot as plt
-plt.imshow(pixel_colors_full)
-plt.show()
+simulated_image = simulator.simulate_image(satellite_position, orientation)
+simulator.display_image(simulated_image)
